@@ -15,6 +15,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -49,7 +50,8 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -91,8 +93,28 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
-    def forward(self, idx,target= None): #target is optional 
+        
+        #weight sharing scheme 
+        self.transformer.wte.weight = self.lm_head.weight #共享词向量矩阵，模型的输入层（将 token ID 转换为向量），也是输出层（将向量映射回 token 的概率分布）
+        #这里等于 50257*768 个数据，30% of 124m，
+        
+        #初始化时initialize 参数
+        self.apply(self.__init__weights)
+        
+    def _init_weights(self, module):
+        #if start out with zeros in residual stream,
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5 # 标准差缩小为 1 / sqrt(2 * n_layer)，其中 n_layer 是模型的总层数。
+            #用正态分布初始化权重，均值为 0，标准差为 std。
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        
+    def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
@@ -106,13 +128,10 @@ class GPT(nn.Module):
             x = block(x)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        
         logits = self.lm_head(x) # (B, T, vocab_size)
-        loss = None #logit loss by default is none
-        if target is not None:
-            # cross_entropy function只可以输入2-dimension的，所以这里flattening out logits，
-            # logits.view(-1, logits.size(-1)) 让B和T变成一个1维的长序列*50257
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
     @classmethod
@@ -164,7 +183,42 @@ class GPT(nn.Module):
 
         return model
 
-# -----------------------------------------------------------------------------#开始准备预训练
+# -----------------------------------------------------------------------------
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        # 将整个训练数据分成若干小份，每一份称为一个 Batch。
+        # 模型在每个 Batch 上计算梯度（反向传播），并立即用优化器（如 SGD、Adam）更新参数。
+        # 模型完整遍历整个训练数据集一次称为一个 Epoch。
+        print(f"loaded {len(self.tokens)} tokens") #number of tokens = 338025，因为有1m个tokens, gpt2 compress ratio 为1：3
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches") #1 epoch = 2640 batches
+
+        # state
+        self.current_position = 0 #初始为0，每次走B*T个
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets 预测的答案
+        # advance the position in the tensor
+        self.current_position += B * T 
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens): #run out of data just loop back
+            self.current_position = 0
+        return x, y
+
+# -----------------------------------------------------------------------------
 # attempt to autodetect the device
 device = "cpu"
 if torch.cuda.is_available():
@@ -172,36 +226,27 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
-device = "cpu" # OVERRIDE
 
-
-# get a data batch
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
-with open(r'C:\Users\choon\OneDrive\Desktop\hw1-code\hw1-code\pretrain\input.txt', 'r') as f: 
-    text = f.read()
-text = text[:1000] #读入前1000个字
-tokens = enc.encode(text)
-B, T = 4, 32 #设
-buf = torch.tensor(tokens[:B*T + 1])
-x = buf[:-1].view(B, T)
-y = buf[1:].view(B, T)
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+    
+train_loader = DataLoaderLite(B=4, T=32)
 
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
-logits, loss = model(x,y) #需要calculate loss,target = y
 
-
-optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4) #Adam 计算
-for i in range(10):
-    optimizer.zero_grad() # 梯度归零,start with zero
-    logits,loss = model(x,y)
+# optimize!
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {(i)}, loss:{(loss.item())}")
-
-#希望loss可以降到最小，不断地拟合预测
+    print(f"step {i}, loss: {loss.item()}") 
 
 import sys; sys.exit(0)
 
