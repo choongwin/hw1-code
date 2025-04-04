@@ -27,17 +27,16 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        #each token lined up in a sequence, had 1020 of them,each token emit 3 vector(qkv)
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs) nh = number of head,
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # q*k
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # masked掉后面的token，看不到后面
-        att = F.softmax(att, dim=-1) #normalize attention
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs) attention*v
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -48,7 +47,7 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = nn.GELU(approximate='tanh') #
+        self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
 
     def forward(self, x):
@@ -86,30 +85,36 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd), #weight of token embedding
-            wpe = nn.Embedding(config.block_size, config.n_embd), #weight of position embedding (nn.Embedding是一个tensor，可以accesss by row)
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) #将768向量映射到50000字里输出
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx): #idx 代表token
-        # idx is of shape (B, T) B=batch size（每一个batch更新一次参数），T=看到的前面的token数
+    def forward(self, idx,target= None): #target is optional 
+        # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
         # forward the token and posisition embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T) ，生成一个 [0, 1, 2, ..., T-1] 的位置序列。
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)，将位置索引映射为位置向量
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)，将 token ID 映射为词向量。
-        x = tok_emb + pos_emb #可以让attention机制知道位置关系，【A,B,C]位置关系
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
         # forward the blocks of the transformer
-        for block in self.transformer.h: #过12层的hidden，每一层包括 自注意力（Self-Attention） 和 前馈网络（FFN），并带有残差连接和层归一化。
+        for block in self.transformer.h:
             x = block(x)
         # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x) #对最后一层的输出做归一化。
-        logits = self.lm_head(x) # (B, T, vocab_size) lm_head：线性层，将隐藏状态映射到词表大小的 logits。
-        return logits
-    
+        x = self.transformer.ln_f(x)
+        
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None #logit loss by default is none
+        if target is not None:
+            # cross_entropy function只可以输入2-dimension的，所以这里flattening out logits，
+            # logits.view(-1, logits.size(-1)) 让B和T变成一个1维的长序列*50257
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        return logits, loss
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -159,36 +164,66 @@ class GPT(nn.Module):
 
         return model
 
-# -----------------------------------------------------------------------------
-num_return_sequences = 5
-max_length = 30
-model = GPT.from_pretrained('gpt2') #初始化
-model.eval()#eval用于当一个模型只是使用而非训练
-model.to('cuda')#可以使用gpu计算
+# -----------------------------------------------------------------------------#开始准备预训练
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+device = "cpu" # OVERRIDE
 
-# prefix tokens 将输入token化
+
+# get a data batch
 import tiktoken
 enc = tiktoken.get_encoding('gpt2')
-tokens = enc.encode("Hello, I'm a language model,")#这行转换成8个token
+with open(r'C:\Users\choon\OneDrive\Desktop\hw1-code\hw1-code\pretrain\input.txt', 'r') as f: 
+    text = f.read()
+text = text[:1000] #读入前1000个字
+tokens = enc.encode(text)
+B, T = 4, 32 #设
+buf = torch.tensor(tokens[:B*T + 1])
+x = buf[:-1].view(B, T)
+y = buf[1:].view(B, T)
+
+# get logits
+model = GPT(GPTConfig())
+model.to(device)
+logits, loss = model(x,y) #需要calculate loss,target = y
+
+
+# optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4) #Adam 计算
+# for i in range(50):
+    
+    
+
+import sys; sys.exit(0)
+
+# prefix tokens
+model.eval()
+num_return_sequences = 5
+max_length = 30
+tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8) 输入5次去预测句子
-x = tokens.to('cuda')
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to(device)
 
 # generate! right now x is (B, T) where B = 5, T = 8
 # set the seed to 42
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
-while x.size(1) < max_length: #每次都会增加一个column 给x，x是输入的token
+while x.size(1) < max_length:
     # forward the model to get the logits
     with torch.no_grad():
         logits = model(x) # (B, T, vocab_size)
         # take the logits at the last position
-        logits = logits[:, -1, :] # (B, vocab_size) 只取最后一个last column 的logit
+        logits = logits[:, -1, :] # (B, vocab_size)
         # get the probabilities
         probs = F.softmax(logits, dim=-1)
         # do top-k sampling of 50 (huggingface pipeline default)
         # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1) #the token sampling always be top 50 and not that random
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
         # select a token from the top-k probabilities
         # note: multinomial does not demand the input to sum to 1
         ix = torch.multinomial(topk_probs, 1) # (B, 1)
@@ -202,5 +237,3 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
-    
-#we ported all the weight , we initialize the gpt2 
