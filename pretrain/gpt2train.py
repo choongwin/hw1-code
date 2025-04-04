@@ -93,6 +93,23 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) #将768向量映射到50000字里输出
 
+    def forward(self, idx): #idx 代表token
+        # idx is of shape (B, T) B=batch size（每一个batch更新一次参数），T=看到的前面的token数
+        B, T = idx.size()
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T) ，生成一个 [0, 1, 2, ..., T-1] 的位置序列。
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)，将位置索引映射为位置向量
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)，将 token ID 映射为词向量。
+        x = tok_emb + pos_emb #可以让attention机制知道位置关系，【A,B,C]位置关系
+        # forward the blocks of the transformer
+        for block in self.transformer.h: #过12层的hidden，每一层包括 自注意力（Self-Attention） 和 前馈网络（FFN），并带有残差连接和层归一化。
+            x = block(x)
+        # forward the final layernorm and the classifier
+        x = self.transformer.ln_f(x) #对最后一层的输出做归一化。
+        logits = self.lm_head(x) # (B, T, vocab_size) lm_head：线性层，将隐藏状态映射到词表大小的 logits。
+        return logits
+    
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
