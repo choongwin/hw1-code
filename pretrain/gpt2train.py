@@ -193,10 +193,15 @@ model.to(device)
 logits, loss = model(x,y) #需要calculate loss,target = y
 
 
-# optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4) #Adam 计算
-# for i in range(50):
-    
-    
+optimizer = torch.optim.AdamW(model.parameters(),lr=3e-4) #Adam 计算
+for i in range(10):
+    optimizer.zero_grad() # 梯度归零,start with zero
+    logits,loss = model(x,y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {(i)}, loss:{(loss.item())}")
+
+#希望loss可以降到最小，不断地拟合预测
 
 import sys; sys.exit(0)
 
