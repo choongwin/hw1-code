@@ -240,7 +240,7 @@ train_loader = DataLoaderLite(B=16, T=1024) #改成真的gpt2
 torch.set_float32_matmul_precision('high') #使用high precision
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 
